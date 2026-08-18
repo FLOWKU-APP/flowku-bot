@@ -10,6 +10,9 @@ Format yang didukung:
   - "50rb makan" / "50000 transport grab"
 """
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Mapping kata kunci ke kategori pengeluaran (sesuai schema Flowku)
 CATEGORY_KEYWORDS = {
@@ -223,7 +226,7 @@ def parse_ocr_items(text: str, custom_categories: list = None) -> list:
         "struk", "receipt", "nota", "invoice", "faktur",
         "kasir", "cashier", "operator", "no.", "nomor",
         "terima kasih", "thank you", "kembali lagi",
-        "member", "diskon", "discount", "promo", "potongan",
+        "member",
         "grand total", "jumlah", "qty", "harga", "price",
         "tanggal", "date", "waktu", "time", "jam",
     ]
@@ -233,6 +236,72 @@ def parse_ocr_items(text: str, custom_categories: list = None) -> list:
     # Pattern 2: "2 x ITEM NAME    70.000" (qty x price)
     # Pattern 3: "ITEM NAME    2    12.500    25.000" (name qty unit_price total)
 
+    # ── DISCOUNT DETECTION ──
+    discount_keywords = ["diskon", "discount", "voucher", "potongan", "promo",
+                         "cashback", "refund", "rebate", "potongan harga", "pengurangan",
+                         "dp", "diskon member", "disc member", "member discount"]
+    discount_items = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        line_lower = line.lower()
+        i += 1
+        if not line:
+            continue
+        if not any(w in line_lower for w in discount_keywords):
+            continue
+
+        # Extract numbers from the line
+        nums = re.findall(r"-?[\d.,]+", line)
+        amounts = []
+        for n in nums:
+            cleaned = n.replace(".", "").replace(",", "")
+            try:
+                val = int(cleaned)
+                if 100 <= abs(val) < 100000000:
+                    amounts.append(abs(val))
+            except ValueError:
+                continue
+
+        # Check for percentage pattern (e.g. "Diskon 10%")
+        pct_match = re.search(r"(\d+(?:[.,]\d+)?)\s*%", line)
+
+        nama = re.sub(r"[\d.,%\-]+", "", line).strip(" -·*.:;x×@#")
+        nama = re.sub(r"\s+", " ", nama).strip()
+        if not nama:
+            nama = "Diskon"
+
+        if amounts:
+            # Use the LAST amount on the line as the discount value
+            val = amounts[-1]
+            # If line has minus sign OR keyword implies reduction → negative
+            if "-" in line or any(w in line_lower for w in ["diskon", "discount", "voucher", "potongan", "promo", "cashback", "refund", "rebate", "pengurangan"]):
+                val = -abs(val)
+            discount_items.append({"nama": nama, "harga": val})
+        elif pct_match:
+            # Percentage only — look at next line for the amount
+            pct = float(pct_match.group(1).replace(",", "."))
+            next_amount = None
+            if i < len(lines):
+                next_line = lines[i].strip()
+                next_nums = re.findall(r"-?[\d.,]+", next_line)
+                for n in next_nums:
+                    cleaned = n.replace(".", "").replace(",", "")
+                    try:
+                        v = int(cleaned)
+                        if 100 <= v < 100000000:
+                            next_amount = v
+                            break
+                    except ValueError:
+                        continue
+            if next_amount:
+                i += 1  # consume the next line
+                discount_items.append({"nama": nama, "harga": -abs(next_amount)})
+            else:
+                # No amount found — skip (can't compute without subtotal)
+                logger.info(f"Discount percentage without amount: {line}")
+
+    # ── ITEM PARSING ──
     for line in lines:
         line = line.strip()
         if not line:
@@ -242,6 +311,10 @@ def parse_ocr_items(text: str, custom_categories: list = None) -> list:
 
         # Skip non-item lines
         if any(w in line_lower for w in skip_words):
+            continue
+
+        # Skip discount lines (already captured above)
+        if any(w in line_lower for w in discount_keywords):
             continue
 
         # Skip lines that are just numbers (like receipt number)
@@ -291,6 +364,11 @@ def parse_ocr_items(text: str, custom_categories: list = None) -> list:
                 "harga": price,
                 "kategori": detect_category(name_part, tx_type="expense", custom_categories=custom_categories),
             })
+
+    # Add discount items (with category)
+    for d in discount_items:
+        d["kategori"] = "other_expense"
+        items.append(d)
 
     # Deduplicate items with same name (OCR sometimes reads same line twice)
     seen = set()

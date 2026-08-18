@@ -17,18 +17,24 @@ CATEGORY_EMOJIS = {
     "entertainment": "🎮", "bills": "⚡", "education": "📚", "beauty": "💄",
     "home": "🏠", "investment": "📈", "social": "🎁", "saving": "🎯",
     "other_expense": "📦", "salary": "💰", "freelance": "💻", "business": "🏪",
-    "investment_in": "📈", "bonus": "🎉", "transfer": "💸", "other_income": "✨"
+    "investment_in": "📈", "bonus": "🎉", "transfer": "💸", "other_income": "✨",
+    "refund": "💸",
 }
 
-from config import APP_PORT, WEBHOOK_SECRET, OWNER_PHONE, REMINDER_HOUR_1, REMINDER_HOUR_2
+from config import (
+    APP_PORT, WEBHOOK_SECRET, OWNER_PHONE, REMINDER_HOUR_1, REMINDER_HOUR_2,
+    SENDER_MODE, WABA_VERIFY_TOKEN,
+)
 from parser import parse_catatan, parse_ocr_items, format_rupiah
 from firestore_db import (
     catat_transaksi, hitung_total_hari_ini, hitung_total_bulan_ini,
     save_ocr_result, get_budget_status, get_user_by_phone, verify_whatsapp,
-    save_pending_transaction,
+    save_pending_transaction, set_ocr_cancelled, is_ocr_cancelled,
 )
-from waha import send_text
-from ocr import extract_text_from_image, extract_items_from_image
+from waha import send_text as waha_send_text
+from waha import send_image as waha_send_image
+import waba
+from ocr import extract_text_from_image, extract_items_from_image, extract_transfer_from_image
 from reminder import cek_dan_kirim_reminder, cek_langganan
 
 logging.basicConfig(
@@ -41,6 +47,25 @@ WIB = pytz.timezone("Asia/Jakarta")
 
 # Scheduler for reminders
 scheduler = AsyncIOScheduler(timezone="Asia/Jakarta")
+
+# ── Deduplication: track processed message IDs (auto-cleanup after 5 min) ──
+import time as _time
+_processed_msg_ids: dict[str, float] = {}  # msg_id -> timestamp
+_DEDUP_TTL = 300  # 5 minutes
+
+def _is_duplicate(msg_id: str) -> bool:
+    """Check if msg_id was already processed. Returns True if duplicate."""
+    if not msg_id:
+        return False
+    now = _time.time()
+    # Cleanup expired entries
+    expired = [k for k, t in _processed_msg_ids.items() if now - t > _DEDUP_TTL]
+    for k in expired:
+        del _processed_msg_ids[k]
+    if msg_id in _processed_msg_ids:
+        return True
+    _processed_msg_ids[msg_id] = now
+    return False
 
 
 @asynccontextmanager
@@ -73,17 +98,47 @@ app = FastAPI(title="Flowku Chatbot", lifespan=lifespan)
 
 
 # ─────────────────────────────────────────────
+# UNIFIED SENDER (WABA or WAHA)
+# ─────────────────────────────────────────────
+
+async def send_text(phone: str, text: str) -> bool:
+    """Kirim pesan teks via sender aktif (WABA atau WAHA)."""
+    if SENDER_MODE == "waba":
+        return await waba.send_text(phone, text)
+    return await waha_send_text(phone, text)
+
+
+async def send_image(phone: str, image_url: str, caption: str = "") -> bool:
+    """Kirim gambar via sender aktif (WABA atau WAHA)."""
+    if SENDER_MODE == "waba":
+        return await waba.send_image(phone, image_url, caption=caption)
+    return await waha_send_image(phone, image_url, caption=caption)
+
+
+# ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
 
 def format_ocr_preview(items: list, ocr_label: str = "🤖 AI") -> str:
     """Format preview OCR items sebelum konfirmasi."""
     total = sum(item["harga"] for item in items)
-    msg = f"{ocr_label} Struk terbaca! {len(items)} item ditemukan:\n\n"
+    discount_total = sum(item["harga"] for item in items if item["harga"] < 0)
+    discount_count = sum(1 for item in items if item["harga"] < 0)
+    item_count = len(items) - discount_count
+    if discount_count:
+        msg = f"{ocr_label} Struk terbaca! {item_count} item + {discount_count} diskon:\n\n"
+    else:
+        msg = f"{ocr_label} Struk terbaca! {len(items)} item ditemukan:\n\n"
     for i, item in enumerate(items, 1):
-        emoji = CATEGORY_EMOJIS.get(item["kategori"], "•")
-        msg += f"  {i}. {emoji} {item['nama']}: {format_rupiah(item['harga'])} ({item['kategori']})\n"
+        harga = item["harga"]
+        if harga < 0:
+            msg += f"  {i}. 💸 {item['nama']}: {format_rupiah(harga)}\n"
+        else:
+            emoji = CATEGORY_EMOJIS.get(item["kategori"], "•")
+            msg += f"  {i}. {emoji} {item['nama']}: {format_rupiah(harga)}\n"
     msg += f"\n💸 Total: {format_rupiah(total)}\n"
+    if discount_count:
+        msg += f"  (hemat {format_rupiah(discount_total)})\n"
     msg += f"\n💾 Simpan semua item ke catatan?"
     msg += f"\n• Balas *Ya* / *Ok* untuk simpan"
     msg += f"\n• Balas *Batal* untuk batal"
@@ -408,30 +463,62 @@ async def handle_text_message(phone: str, text: str) -> str:
             if pending.get("type") == "ocr_items":
                 items = pending["items"]
                 raw_text = pending.get("raw_text", "")
+
+                # ── Separate positive items & discounts ──
+                positive = [it for it in items if it["harga"] > 0]
+                discounts = [it for it in items if it["harga"] < 0]
+                total_discount = abs(sum(it["harga"] for it in discounts))
+                discount_count = len(discounts)
+
+                # Save positive items at original price
                 total = 0
                 saved_items = []
-                for item in items:
+                for it in positive:
                     result = catat_transaksi(
                         user_phone=phone,
                         tipe="expense",
-                        jumlah=item["harga"],
-                        kategori=item["kategori"],
-                        keterangan=item["nama"],
+                        jumlah=it["harga"],
+                        kategori=it["kategori"],
+                        keterangan=it["nama"],
                         source="wa_bot_ocr",
                     )
                     if result:
-                        total += item["harga"]
-                        saved_items.append(item)
-                save_ocr_result(phone, raw_text, saved_items)
+                        total += it["harga"]
+                        saved_items.append(it)
+
+                # Save each discount as income (refund)
+                saved_discounts = []
+                for disc in discounts:
+                    disc_amount = abs(disc["harga"])
+                    result = catat_transaksi(
+                        user_phone=phone,
+                        tipe="income",
+                        jumlah=disc_amount,
+                        kategori="refund",
+                        keterangan=disc["nama"],
+                        source="wa_bot_ocr",
+                    )
+                    if result:
+                        total -= disc_amount
+                        saved_discounts.append(disc)
+
+                all_saved = saved_items + saved_discounts
+                save_ocr_result(phone, raw_text, all_saved)
                 save_pending_transaction(phone, None)
-                if saved_items:
+                if all_saved:
                     uid = user.get("uid")
                     daily = hitung_total_hari_ini(phone, uid=uid)
-                    msg_out = f"✅ {len(saved_items)} item tersimpan!\n\n"
+                    item_total = discount_count + len(saved_items)
+                    msg_out = f"✅ {item_total} item tersimpan!\n\n"
                     for item in saved_items:
                         emoji = CATEGORY_EMOJIS.get(item["kategori"], "•")
                         msg_out += f"  {emoji} {item['nama']}: {format_rupiah(item['harga'])} ({item['kategori']})\n"
-                    msg_out += f"\n💸 Total: {format_rupiah(total)}"
+                    for disc in saved_discounts:
+                        emoji = CATEGORY_EMOJIS.get("refund", "•")
+                        msg_out += f"  {emoji} {disc['nama']}: {format_rupiah(disc['harga'])} (refund)\n"
+                    if discount_count:
+                        msg_out += f"\n  💸 Hemat: {format_rupiah(total_discount)}"
+                    msg_out += f"\n\n💸 Total: {format_rupiah(total)}"
                     msg_out += f"\n\n📊 Total hari ini: {format_rupiah(daily['pengeluaran'])}"
                     return msg_out
                 else:
@@ -453,6 +540,7 @@ async def handle_text_message(phone: str, text: str) -> str:
                 return "❌ Gagal menyimpan transaksi. Silakan hubungi admin."
         elif msg in ("batal", "b", "tidak", "no", "cancel", "t"):
             save_pending_transaction(phone, None)
+            set_ocr_cancelled(phone, True)  # cancel in-flight OCR jika sedang jalan
             return "❌ *Pencatatan dibatalkan*\n\nTransaksi Anda tidak disimpan."
         else:
             # ── OCR pending: JANGAN auto-cancel, minta user pilih ──
@@ -567,6 +655,9 @@ async def handle_image_message(phone: str, media_url: str, base64_data: str = No
     if not media_url and not base64_data:
         return "Gagal terima gambar. Coba kirim ulang."
 
+    # ── CLEAR ocrCancelled flag sebelum mulai OCR baru ──
+    set_ocr_cancelled(phone, False)
+
     # ── CEK: ada struk pending belum disimpan? ──
     pending = user.get("pendingTransaction")
     if pending and pending.get("type") == "ocr_items":
@@ -669,6 +760,12 @@ async def handle_image_message(phone: str, media_url: str, base64_data: str = No
     # ── KONFIRMASI DULU SEBELUM SIMPAN ──
     ocr_label = "🤖 AI" if not raw_text else "📸"
 
+    # ── CANCEL CHECK: cek apakah user sudah cancel selama OCR berjalan ──
+    if is_ocr_cancelled(phone):
+        logger.info(f"OCR completed but user cancelled during processing — skipped for {phone}")
+        set_ocr_cancelled(phone, False)  # reset flag
+        return "✅ Pencatatan sudah dibatalkan."
+
     # Simpan ke pending (belum simpan ke transaksi)
     save_pending_transaction(phone, {
         "type": "ocr_items",
@@ -709,6 +806,20 @@ async def webhook(request: Request):
         await handle_incoming_message(payload)
 
     return {"status": "ok"}
+
+
+async def _process_waha_image(phone: str, media_url: str, base64_data=None):
+    """Background task: OCR + kirim hasil via WAHA (tidak blokir webhook)."""
+    try:
+        await send_text(phone, "📸 Sedang membaca struk...")
+        response = await handle_image_message(phone, media_url, base64_data=base64_data)
+        await send_text(phone, response)
+    except Exception as e:
+        logger.error(f"WAHA background image error: {e}", exc_info=True)
+        try:
+            await send_text(phone, "Ada error, coba lagi ya 😅")
+        except Exception:
+            pass
 
 
 async def handle_incoming_message(payload: dict):
@@ -814,10 +925,8 @@ async def handle_incoming_message(payload: dict):
                             logger.info("Image has mediaKey but no direct URL — may need WAHA media API")
 
             logger.info(f"Image processing: media_url={'yes' if media_url else 'no'}, base64={'yes' if base64_data else 'no'}")
-            # Quick response sambil tunggu OCR
-            await send_text(phone, "📸 Sedang membaca struk...")
-            response = await handle_image_message(phone, media_url, base64_data=base64_data)
-            await send_text(phone, response)
+            # ── Background task: return webhook cepat, OCR jalan di belakang ──
+            asyncio.create_task(_process_waha_image(phone, media_url, base64_data))
 
         else:
             await send_text(phone, "Ketik *bantuan* untuk liat perintah yang tersedia.")
@@ -825,6 +934,164 @@ async def handle_incoming_message(payload: dict):
     except Exception as e:
         logger.error(f"Error handling message: {e}", exc_info=True)
         await send_text(phone, "Ada error, coba lagi ya 😅")
+
+
+# ─────────────────────────────────────────────
+# WABA WEBHOOK (Meta Cloud API)
+# ─────────────────────────────────────────────
+
+@app.get("/waba/webhook")
+async def waba_verify(request: Request):
+    """Webhook verification endpoint (GET) — Meta Cloud API."""
+    from fastapi.responses import PlainTextResponse
+    params = dict(request.query_params)
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    logger.info(f"WABA verify: mode={mode}, token={token}, challenge={challenge}")
+
+    if mode == "subscribe" and token == WABA_VERIFY_TOKEN:
+        logger.info("WABA webhook verified!")
+        return PlainTextResponse(challenge)
+    else:
+        logger.warning("WABA verification failed!")
+        return Response(status_code=403, content="Forbidden")
+
+
+@app.post("/waba/webhook")
+async def waba_webhook(request: Request):
+    """Webhook callback endpoint (POST) — Meta Cloud API."""
+    body = await request.json()
+
+    logger.info(f"WABA webhook: {json.dumps(body, indent=2)[:1000]}")
+
+    # Validate
+    if body.get("object") != "whatsapp_business_account":
+        logger.warning(f"WABA unexpected object: {body.get('object')}")
+        return Response(status_code=400, content="Bad Request")
+
+    # Process entries
+    for entry in body.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            field = change.get("field")
+
+            if field == "messages":
+                messages = value.get("messages", [])
+                contacts = value.get("contacts", [])
+
+                for msg in messages:
+                    await _handle_waba_message(msg, contacts)
+
+            elif field == "account_update":
+                statuses = value.get("statuses", [])
+                for status in statuses:
+                    logger.info(f"WABA status: {status.get('id')} -> {status.get('status')}")
+
+    # Always return 200 quickly
+    return {"status": "ok"}
+
+
+async def _process_waba_image(sender: str, media_id: str, msg_id: str = ""):
+    """Background task: download media + OCR + kirim hasil (tidak blokir webhook).
+    
+    KirimDev media download flow:
+    1. GET /v1/{phone_id}/messages/{wamid}/media → returns download URL
+    2. GET the download URL to get the actual bytes
+    
+    Fallback: GET /v1/{media_id} if KirimDev proxy also supports Meta compat.
+    """
+    try:
+        # KirimDev: use wamid (msg_id) to fetch media URL via KirimDev endpoint
+        # Falls back to media_id if wamid not available
+        media_url = await waba.get_media_url(media_id, wamid=msg_id)
+        base64_data = None
+        if media_url:
+            raw = await waba.download_media(media_url)
+            if raw:
+                import base64 as b64
+                base64_data = b64.b64encode(raw).decode()
+                logger.info(f"KirimDev image downloaded: {len(raw)} bytes (msg_id={msg_id})")
+            else:
+                logger.warning("KirimDev image download returned empty")
+        else:
+            logger.warning(f"KirimDev could not get media URL for {media_id} (wamid={msg_id})")
+
+        await send_text(sender, "📸 Sedang membaca struk...")
+        response = await handle_image_message(sender, media_url, base64_data=base64_data)
+        await send_text(sender, response)
+    except Exception as e:
+        logger.error(f"KirimDev background image error: {e}", exc_info=True)
+        try:
+            await send_text(sender, "Ada error, coba lagi ya 😅")
+        except Exception:
+            pass
+
+
+async def _handle_waba_message(msg: dict, contacts: list):
+    """Proses satu pesan WABA — translate ke handler yang sama."""
+    sender = msg.get("from", "")
+    msg_type = msg.get("type", "")
+    msg_id = msg.get("id", "")
+
+    # ── DEDUP: Meta retry webhook kalau response lambat → jangan proses 2x ──
+    if msg_id and _is_duplicate(msg_id):
+        logger.info(f"WABA duplicate msg_id={msg_id} (retry) — skipped")
+        return
+
+    contact_name = "Unknown"
+    for c in contacts:
+        if c.get("wa_id") == sender:
+            contact_name = c.get("profile", {}).get("name", "Unknown")
+            break
+
+    logger.info(f"WABA msg: from={contact_name}({sender}) type={msg_type} id={msg_id}")
+
+    try:
+        if msg_type == "text":
+            text = msg.get("text", {}).get("body", "")
+            logger.info(f"WABA text: {text[:100]}")
+            response = await handle_text_message(sender, text)
+            await send_text(sender, response)
+
+        elif msg_type == "image":
+            media_id = msg.get("image", {}).get("id", "")
+            logger.info(f"WABA image: media_id={media_id} msg_id={msg_id}")
+
+            if media_id:
+                # ── Background task: return 200 cepat, OCR jalan di belakang ──
+                asyncio.create_task(_process_waba_image(sender, media_id, msg_id))
+            else:
+                await send_text(sender, "Gagal terima gambar. Coba kirim ulang.")
+
+        elif msg_type == "button":
+            button_text = msg.get("button", {}).get("text", "")
+            logger.info(f"WABA button: {button_text}")
+            response = await handle_text_message(sender, button_text)
+            await send_text(sender, response)
+
+        elif msg_type == "interactive":
+            interactive = msg.get("interactive", {})
+            # Handle list replies and button replies
+            if interactive.get("type") == "button_reply":
+                btn_text = interactive.get("button_reply", {}).get("title", "")
+                response = await handle_text_message(sender, btn_text)
+                await send_text(sender, response)
+            elif interactive.get("type") == "list_reply":
+                list_text = interactive.get("list_reply", {}).get("title", "")
+                response = await handle_text_message(sender, list_text)
+                await send_text(sender, response)
+            else:
+                await send_text(sender, "Ketik *bantuan* untuk liat perintah yang tersedia.")
+
+        else:
+            logger.info(f"WABA unhandled type: {msg_type}")
+            await send_text(sender, "Ketik *bantuan* untuk liat perintah yang tersedia.")
+
+    except Exception as e:
+        logger.error(f"WABA error handling message: {e}", exc_info=True)
+        await send_text(sender, "Ada error, coba lagi ya 😅")
 
 
 # ─────────────────────────────────────────────
@@ -838,8 +1105,8 @@ async def root():
 
 @app.get("/health")
 async def health():
-    from waha import check_session
-    session = await check_session()
+    from config import SENDER_MODE
+    session = {"status": "N/A"}
 
     # Check Firestore connection
     try:
@@ -852,7 +1119,8 @@ async def health():
 
     return {
         "status": "ok",
-        "waha_session": session.get("status", "UNKNOWN"),
+        "sender_mode": SENDER_MODE,
+        "waha_session": session.get("status", "N/A"),
         "firestore": "connected" if firestore_ok else "error",
         "user_registered": user_found,
         "owner_phone": OWNER_PHONE or "NOT SET",
@@ -874,6 +1142,94 @@ async def test_reminder(x_webhook_secret: str = Header(None)):
         raise HTTPException(status_code=403, detail="Invalid secret token")
     await cek_dan_kirim_reminder()
     return {"status": "reminder sent"}
+
+
+# ─────────────────────────────────────────────
+# SCAN RECEIPT API (Mobile App)
+# ─────────────────────────────────────────────
+
+@app.post("/api/scan-receipt")
+async def scan_receipt(request: Request):
+    """
+    Scan bukti transfer atau struk belanja.
+    Mobile app kirim gambar (base64), server proses OCR, return items/transfer data.
+
+    Body:
+      type: "transfer" | "receipt"
+      image: base64 encoded image
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    scan_type = body.get("type", "receipt")
+    image_data = body.get("image", "")
+
+    if not image_data:
+        raise HTTPException(status_code=400, detail="Missing 'image' field (base64)")
+
+    # Strip data URL prefix if present (e.g. "data:image/jpeg;base64,...")
+    if image_data.startswith("data:"):
+        image_data = image_data.split(",", 1)[1] if "," in image_data else image_data
+
+    logger.info(f"Scan receipt: type={scan_type}, image_len={len(image_data)}")
+
+    try:
+        if scan_type == "transfer":
+            result = await extract_transfer_from_image(base64_data=image_data)
+
+            if result["success"] and result["data"]:
+                return {
+                    "type": "transfer",
+                    "data": result["data"],
+                }
+            else:
+                # Fallback: return raw text for client-side parsing
+                return {
+                    "type": "transfer",
+                    "data": None,
+                    "rawText": result.get("raw_text", ""),
+                    "reason": result.get("reason", "Gagal membaca bukti transfer"),
+                }
+
+        elif scan_type == "receipt":
+            result = await extract_items_from_image("", base64_data=image_data)
+
+            if result["is_receipt"] and result["items"]:
+                total = sum(item.get("harga", 0) for item in result["items"])
+                return {
+                    "type": "receipt",
+                    "data": {
+                        "items": result["items"],
+                        "total": total,
+                    },
+                }
+            elif result["is_receipt"]:
+                # Items parsed from text fallback
+                return {
+                    "type": "receipt",
+                    "data": None,
+                    "rawText": result.get("reason", ""),
+                    "reason": "Struk terbaca tapi gagal parse items",
+                }
+            else:
+                return {
+                    "type": "receipt",
+                    "data": None,
+                    "reason": result.get("reason", "Gambar bukan struk"),
+                }
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid type '{scan_type}'. Use 'transfer' or 'receipt'."
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Scan receipt error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"OCR processing error: {str(e)}")
 
 
 if __name__ == "__main__":

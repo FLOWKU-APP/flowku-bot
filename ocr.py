@@ -19,11 +19,11 @@ logger = logging.getLogger(__name__)
 USE_GEMINI = False
 try:
     from google import genai
-    from config import GEMINI_API_KEY
+    from config import GEMINI_API_KEY, GEMINI_MODELS
     if GEMINI_API_KEY:
         _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         USE_GEMINI = True
-        logger.info("Gemini OCR available — using as primary backend")
+        logger.info(f"Gemini OCR available — models: {', '.join(GEMINI_MODELS)}")
     else:
         logger.info("GEMINI_API_KEY not set, skipping Gemini OCR")
 except Exception as e:
@@ -37,6 +37,41 @@ try:
     logger.info("Using Google Cloud Vision for OCR")
 except Exception:
     logger.info("Google Vision not available, using Tesseract")
+
+
+# ════════════════════════════════════════════
+# GEMINI MODEL FALLBACK HELPER
+# ════════════════════════════════════════════
+
+def _gemini_generate(contents: list, models: list = None) -> str:
+    """
+    Try Gemini API with model fallback chain.
+    Returns response text from first successful model.
+    Raises last exception if all models fail.
+    """
+    models = models or GEMINI_MODELS
+    last_err = None
+
+    for model in models:
+        try:
+            response = _gemini_client.models.generate_content(
+                model=model,
+                contents=contents,
+            )
+            return response.text.strip()
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
+                logger.warning(f"Gemini {model} rate limited (429) — trying next model")
+            elif "not found" in err_str.lower() or "404" in err_str:
+                logger.warning(f"Gemini {model} not available — trying next model")
+            else:
+                logger.warning(f"Gemini {model} error: {e} — trying next model")
+            last_err = e
+            continue
+
+    # All models failed
+    raise last_err or Exception("All Gemini models failed")
 
 
 # ════════════════════════════════════════════
@@ -293,8 +328,7 @@ def ocr_gemini(image_path: str) -> str:
     try:
         from PIL import Image
         img = Image.open(image_path)
-        response = _gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+        text = _gemini_generate(
             contents=[
                 "Extract ALL text from this receipt image. Return the raw text exactly as visible, "
                 "preserving line breaks and layout. Include store name, items, quantities, prices, "
@@ -302,7 +336,6 @@ def ocr_gemini(image_path: str) -> str:
                 img,
             ],
         )
-        text = response.text.strip()
         logger.info(f"Gemini OCR extracted {len(text)} chars")
         return text
     except Exception as e:
@@ -396,6 +429,14 @@ Rules:
 - If quantity shown (e.g. "2x"), still use total price for that line
 - Return [] if no clear items found
 
+SPECIAL RULES FOR DISCOUNTS/VOUCHERS/DEDUCTIONS:
+- Detect discount, voucher, potongan, promo, cashback, refund, rebate lines
+- Set harga to NEGATIVE integer, e.g. "Diskon 5.000" → {"nama": "Diskon Member", "harga": -5000, "kategori": "other_expense"}
+- For percentage discounts (e.g. "Diskon 10%"), calculate the actual Rupiah amount from the receipt total/subtotal and use that as negative harga
+- Common patterns: "Diskon -Rp5.000", "Voucher -Rp10.000", "Potongan 2.000", "Promo -Rp3.000", "Cashback -Rp5.000"
+- Use the ORIGINAL text from the receipt as nama (e.g. "Diskon Member", "Voucher Shopee", "Potongan Promo")
+- ALWAYS include discount items even with negative harga — they reduce the total cost
+
 SPECIAL RULES FOR FUEL/BBM:
 - If receipt is from SPBU/Pertamina/Shell/BP/Vivo or contains fuel types (Pertalite, Pertamax, Dexlite, Solar, Premium, Turbo, RON 90/92/95/98), set kategori="transport"
 - For fuel items, set nama="Bensin [type]" e.g. "Bensin Pertalite", "Bensin Pertamax", "Bensin Shell V-Power"
@@ -414,11 +455,9 @@ SPECIAL RULES FOR MINIMARKET (Alfamart, Indomaret, Circle K, Lawson, Family Mart
 
 Example: [{"nama": "Nasi Goreng", "harga": 25000, "kategori": "food"}, {"nama": "Bensin Pertalite", "harga": 50000, "kategori": "transport"}]"""
 
-        response = _gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+        raw = _gemini_generate(
             contents=[prompt, img],
         )
-        raw = response.text.strip()
 
         # Clean up: remove markdown code blocks if present
         if raw.startswith("```"):
@@ -449,7 +488,14 @@ Example: [{"nama": "Nasi Goreng", "harga": 25000, "kategori": "food"}, {"nama": 
             kategori = str(item.get("kategori", "other_expense")).strip().lower()
             if kategori not in valid_cats:
                 kategori = "other_expense"
-            if nama and harga > 0 and _is_valid_item_name(nama):
+            # Allow negative harga for discounts (but still validate name)
+            if nama and (harga > 0 or harga < 0) and _is_valid_item_name(nama):
+                # Extra check: negative items should be actual discounts
+                if harga < 0:
+                    discount_words = ["diskon", "discount", "voucher", "potongan", "promo", "cashback", "refund", "rebate", "potongan harga", "pengurangan"]
+                    if not any(w in nama.lower() for w in discount_words):
+                        logger.debug(f"Skipping non-discount negative item: {nama}")
+                        continue
                 cleaned.append({"nama": nama, "harga": harga, "kategori": kategori})
 
         logger.info(f"Gemini structured OCR: {len(cleaned)} items extracted")
@@ -464,6 +510,95 @@ Example: [{"nama": "Nasi Goreng", "harga": 25000, "kategori": "food"}, {"nama": 
             logger.warning(f"Gemini API rate limited (429) — falling back to Tesseract")
         else:
             logger.error(f"Gemini structured OCR error: {e}")
+        return None
+
+
+def ocr_gemini_structured_transfer(image_path: str) -> dict | None:
+    """
+    Gemini OCR khusus bukti transfer: extract amount, recipient, bank, ref, dll.
+    Returns dict {amount, description, date, bankSource, bankTarget,
+                  recipientName, accountNumber, referenceCode, confidence}
+    atau None kalau gagal.
+    """
+    try:
+        from PIL import Image
+        img = Image.open(image_path)
+
+        prompt = """Analyze this bank transfer receipt/screenshot from an Indonesian bank or e-wallet.
+Supported: BCA, Mandiri, BNI, BRI, BSI, CIMB, Permata, Danamon, BTN, Jenius, SeaBank,
+GoPay, OVO, Dana, ShopeePay, Flip, etc.
+
+Extract and return ONLY a JSON object (no markdown, no explanation):
+{
+  "amount": <integer in Rupiah, no dots/commas>,
+  "description": "<short description of the transfer>",
+  "date": "<YYYY-MM-DD format>",
+  "bankSource": "<sender bank name or null>",
+  "bankTarget": "<recipient bank name or null>",
+  "recipientName": "<recipient name or null>",
+  "accountNumber": "<account number or null>",
+  "referenceCode": "<transaction reference code or null>",
+  "confidence": "<high|medium|low>"
+}
+
+Rules:
+- amount = integer, no dots/commas, e.g. 150000 not "150.000"
+- If cannot find amount, set amount to null
+- date in ISO format YYYY-MM-DD. If not found, set to null
+- bankSource: detect from logo, header, or app name (e.g. "BCA", "Mandiri", "GoPay")
+- bankTarget: recipient's bank. If same bank, can be same as bankSource
+- recipientName: the person/entity receiving the money
+- accountNumber: recipient account number (remove spaces/dashes)
+- referenceCode: transaction ID/reference number
+- confidence: "high" if amount+recipient found, "medium" if only amount, "low" if barely readable
+- Return {} (empty object) if image is NOT a transfer receipt at all"""
+
+        raw = _gemini_generate(
+            contents=[prompt, img],
+        )
+
+        # Clean markdown blocks
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        raw = raw.strip()
+        if raw.startswith("json"):
+            raw = raw[4:].strip()
+
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not data:
+            logger.warning("Gemini transfer OCR returned empty/non-dict")
+            return None
+
+        # Normalize
+        result = {
+            "amount": int(data.get("amount", 0)) if data.get("amount") else None,
+            "description": str(data.get("description", "")).strip() or None,
+            "date": str(data.get("date", "")).strip() or None,
+            "bankSource": str(data.get("bankSource", "")).strip() or None,
+            "bankTarget": str(data.get("bankTarget", "")).strip() or None,
+            "recipientName": str(data.get("recipientName", "")).strip() or None,
+            "accountNumber": str(data.get("accountNumber", "")).strip() or None,
+            "referenceCode": str(data.get("referenceCode", "")).strip() or None,
+            "confidence": str(data.get("confidence", "low")).strip(),
+        }
+
+        if result["confidence"] not in ("high", "medium", "low"):
+            result["confidence"] = "low"
+
+        logger.info(f"Gemini transfer OCR: amount={result['amount']}, bank={result['bankSource']}, conf={result['confidence']}")
+        return result
+
+    except json.JSONDecodeError as e:
+        logger.warning(f"Gemini transfer OCR JSON parse error: {e}")
+        return None
+    except Exception as e:
+        err_str = str(e)
+        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
+            logger.warning(f"Gemini API rate limited (429) — transfer OCR failed")
+        else:
+            logger.error(f"Gemini transfer OCR error: {e}")
         return None
 
 
@@ -606,6 +741,53 @@ async def extract_items_from_image(image_url: str, base64_data: str = None) -> d
         result["is_receipt"] = True
         result["items"] = None  # Caller will use text + parse_ocr_items
         result["reason"] = text  # Reuse reason field for raw text fallback
+        return result
+
+    result["reason"] = "Gagal membaca teks dari gambar"
+    return result
+
+
+async def extract_transfer_from_image(image_url: str = None, base64_data: str = None) -> dict:
+    """
+    Full pipeline untuk bukti transfer.
+    Returns: {success: bool, data: dict|None, raw_text: str, reason: str}
+    """
+    result = {"success": False, "data": None, "raw_text": "", "reason": ""}
+
+    local_path = await _resolve_local_path(image_url, base64_data)
+    if not local_path:
+        result["reason"] = "Gagal download gambar"
+        return result
+
+    # ── STEP 1: Gemini structured transfer OCR ──
+    if USE_GEMINI:
+        data = ocr_gemini_structured_transfer(local_path)
+        if data:
+            result["success"] = True
+            result["data"] = data
+            return result
+
+    # ── STEP 2: Fallback — Gemini raw text + regex parsing ──
+    if USE_GEMINI:
+        text = ocr_gemini(local_path)
+        if text.strip():
+            result["raw_text"] = text
+            result["reason"] = "Gemini OCR teks saja (structured gagal)"
+            return result
+
+    # ── STEP 3: Google Vision fallback ──
+    if USE_GOOGLE_VISION:
+        text = ocr_google_vision(local_path)
+        if text.strip():
+            result["raw_text"] = text
+            result["reason"] = "Google Vision OCR (structured gagal)"
+            return result
+
+    # ── STEP 4: Tesseract fallback ──
+    text = ocr_tesseract(local_path)
+    if text.strip():
+        result["raw_text"] = text
+        result["reason"] = "Tesseract OCR (structured gagal)"
         return result
 
     result["reason"] = "Gagal membaca teks dari gambar"

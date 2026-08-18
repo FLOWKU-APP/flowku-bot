@@ -74,6 +74,31 @@ def save_pending_transaction(phone: str, pending_tx: dict | None) -> bool:
     return False
 
 
+def set_ocr_cancelled(phone: str, cancelled: bool) -> bool:
+    """
+    Set/clear ocrCancelled flag on user doc.
+    Used to cancel in-flight OCR when user types 'batal'.
+    """
+    db = get_db()
+    docs = db.collection("users").where("waPhone", "==", phone).limit(1).stream()
+    for doc in docs:
+        doc.reference.update({"ocrCancelled": cancelled})
+        return True
+    return False
+
+
+def is_ocr_cancelled(phone: str) -> bool:
+    """
+    Check if ocrCancelled flag is set for this user.
+    """
+    db = get_db()
+    docs = db.collection("users").where("waPhone", "==", phone).limit(1).stream()
+    for doc in docs:
+        data = doc.to_dict()
+        return data.get("ocrCancelled", False)
+    return False
+
+
 def get_couple(uid: str) -> dict | None:
     """
     Ambil data couple berdasarkan uid.
