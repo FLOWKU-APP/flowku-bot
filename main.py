@@ -1095,6 +1095,54 @@ async def _handle_waba_message(msg: dict, contacts: list):
 
 
 # ─────────────────────────────────────────────
+# CHATIN INTEGRATION ENDPOINT
+# ─────────────────────────────────────────────
+
+@app.post("/chatin/process")
+async def chatin_process(request: Request):
+    """
+    Terima pesan dari Chatin dashboard, proses via Flowku bot logic,
+    dan return reply text (tanpa mengirim WhatsApp — Chatin yang kirim).
+    """
+    from config import CHATIN_WEBHOOK_SECRET
+
+    secret = request.headers.get("x-chatin-secret", "")
+    if not CHATIN_WEBHOOK_SECRET or secret != CHATIN_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid Chatin secret")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    phone = body.get("phone", "")
+    text = body.get("text", "")
+    msg_type = body.get("type", "text")
+
+    if not phone:
+        return {"reply": "⚠️ Nomor telepon tidak ditemukan."}
+
+    logger.info(f"[Chatin] Incoming: type={msg_type}, from={phone}, text={text[:60]}")
+
+    try:
+        if msg_type == "text" and text:
+            reply = await handle_text_message(phone, text)
+        elif msg_type == "image":
+            media_url = body.get("media_url", "")
+            if media_url:
+                reply = await handle_image_message(phone, media_url)
+            else:
+                reply = "⚠️ URL gambar tidak ditemukan."
+        else:
+            reply = "Ketik *bantuan* untuk liat perintah yang tersedia."
+    except Exception as e:
+        logger.error(f"[Chatin] Error processing message: {e}", exc_info=True)
+        reply = "Ada error saat memproses pesan, coba lagi ya 😅"
+
+    return {"reply": reply}
+
+
+# ─────────────────────────────────────────────
 # HEALTH & INFO ENDPOINTS
 # ─────────────────────────────────────────────
 

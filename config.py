@@ -53,3 +53,6 @@ REMINDER_HOUR_2 = 20  # WIB
 
 # Owner phone (for receiving reminders)
 OWNER_PHONE = os.getenv("OWNER_PHONE", "")  # e.g. "6281234567890"
+
+# Chatin Integration
+CHATIN_WEBHOOK_SECRET = os.getenv("CHATIN_WEBHOOK_SECRET", "")
